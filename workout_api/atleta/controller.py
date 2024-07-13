@@ -1,17 +1,26 @@
 from datetime import datetime
 from uuid import uuid4
-from fastapi import APIRouter, Body, HTTPException, status
+import logging
+
+from fastapi import APIRouter, Body, HTTPException, status, Depends
 from pydantic import UUID4
 
-from workout_api.atleta.schemas import AtletaIn, AtletaOut, AtletaUpdate
+from fastapi_pagination import LimitOffsetPage, LimitOffsetParams
+from fastapi_pagination.ext.sqlalchemy import paginate
+
+from workout_api.atleta.schemas import AtletaIn, AtletaOut, AtletaUpdate, AtletaSimpleOut
 from workout_api.atleta.models import AtletaModel
 from workout_api.categorias.models import CategoriaModel
 from workout_api.centro_treinamento.models import CentroTreinamentoModel
 
 from workout_api.contrib.dependencies import DatabaseDependency
 from sqlalchemy.future import select
+from sqlalchemy.exc import IntegrityError
+from typing import Optional
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 @router.post(
     '/', 
@@ -54,6 +63,11 @@ async def post(
         
         db_session.add(atleta_model)
         await db_session.commit()
+    except IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_303_SEE_OTHER, 
+            detail=f"Já existe um atleta cadastrado com o cpf: {atleta_in.cpf}"
+        )
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
@@ -63,16 +77,52 @@ async def post(
     return atleta_out
 
 
+
 @router.get(
     '/', 
     summary='Consultar todos os Atletas',
     status_code=status.HTTP_200_OK,
-    response_model=list[AtletaOut],
+    response_model=LimitOffsetPage[AtletaSimpleOut],
 )
-async def query(db_session: DatabaseDependency) -> list[AtletaOut]:
-    atletas: list[AtletaOut] = (await db_session.execute(select(AtletaModel))).scalars().all()
+async def query(
+    db_session: DatabaseDependency,
+    nome: Optional[str] = None,
+    cpf: Optional[str] = None,
+    params: LimitOffsetParams = Depends()
+) -> LimitOffsetPage[AtletaSimpleOut]:
+    query = select(AtletaModel)
+
+    try:
+        # Validações simples de entrada
+        if nome and not nome.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome não pode ser vazio.")
+        if cpf and not cpf.isdigit():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CPF deve conter apenas dígitos.")
+        
+        query = select(AtletaModel)
+
+        if nome:
+            query = query.filter(AtletaModel.nome.contains(nome))
+        if cpf:
+            query = query.filter(AtletaModel.cpf == cpf)
+
+        paginated_result = await paginate(db_session, query, params)
+        logger.info(f'Resultado paginado: {paginated_result}')
+        
+        return paginated_result
     
-    return [AtletaOut.model_validate(atleta) for atleta in atletas]
+    except HTTPException as http_exc:
+        # Re-levanta a exceção HTTP para ser tratada pelo FastAPI
+        logger.error(f"Erro na requisição: {http_exc.detail}")
+        raise http_exc
+    except SQLAlchemyError as db_exc:
+        # Loga erros específicos do SQLAlchemy
+        logger.error(f"Erro no banco de dados: {str(db_exc)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro no banco de dados.")
+    except Exception as exc:
+        # Captura todas as outras exceções
+        logger.error(f"Erro inesperado: {str(exc)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro inesperado.")
 
 
 @router.get(
